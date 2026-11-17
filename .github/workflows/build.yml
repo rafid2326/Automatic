@@ -1,0 +1,407 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+      - name: Create project files
+        run: |
+          mkdir -p app/src/main/java/com/autofill/helper app/src/main/res/xml app/src/main/res/values
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "AutoFill"
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.autofill.helper'
+              compileSdk 34
+              defaultConfig {
+                  applicationId "com.autofill.helper"
+                  minSdk 26
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes { release { minifyEnabled false } }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="@string/app_name"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <service
+                      android:name=".AutoService"
+                      android:exported="false"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/accessibility_config" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/res/xml/accessibility_config.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
+              android:canRetrieveWindowContent="true"
+              android:notificationTimeout="100"
+              android:description="@string/service_desc" />
+          EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Auto Fill</string>
+              <string name="service_desc">Auto fill names, area code and tap Start / Phone number / New number / Create number.</string>
+          </resources>
+          EOF
+          cat > app/src/main/java/com/autofill/helper/Config.kt <<'EOF'
+          package com.autofill.helper
+
+          object Config {
+              val START = listOf("start building now")
+              val FIRST = listOf("first name", "firstname", "given name")
+              val LAST = listOf("last name", "lastname", "surname", "family name")
+              val PHONE = listOf("phone number", "get number")
+              val NEW = listOf("new number")
+              val AREA = listOf("area code")
+              val CREATE = listOf("create number")
+              val EMAIL = listOf("email")
+              val OTP = listOf("otp", "verification code", "one-time", "security code")
+
+              const val TICK_MS = 1500L
+              const val START_RETRY_MS = 8000L
+          }
+
+          object Names {
+              val first = listOf(
+                  "James", "Michael", "Robert", "David", "William", "Daniel", "Joseph", "Thomas", "Ryan", "Kevin",
+                  "Brian", "Jason", "Eric", "Adam", "Nathan", "Tyler", "Justin", "Aaron", "Jacob", "Ethan",
+                  "Emma", "Olivia", "Sophia", "Isabella", "Ava", "Mia", "Emily", "Abigail", "Madison", "Chloe",
+                  "Hannah", "Grace", "Lily", "Natalie", "Rachel", "Sarah", "Megan", "Laura", "Jessica", "Amanda"
+              )
+              val last = listOf(
+                  "Smith", "Johnson", "Williams", "Brown", "Jones", "Miller", "Davis", "Wilson", "Anderson", "Taylor",
+                  "Moore", "Jackson", "Martin", "Lee", "Thompson", "White", "Harris", "Clark", "Lewis", "Walker",
+                  "Hall", "Allen", "Young", "King", "Wright", "Scott", "Green", "Baker", "Adams", "Nelson",
+                  "Hill", "Campbell", "Mitchell", "Roberts", "Carter", "Phillips", "Evans", "Turner", "Parker", "Collins"
+              )
+          }
+          EOF
+          cat > app/src/main/java/com/autofill/helper/MainActivity.kt <<'EOF'
+          package com.autofill.helper
+
+          import android.app.Activity
+          import android.content.Intent
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val d = resources.displayMetrics.density
+                  val pad = (20 * d).toInt()
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(pad, pad, pad, pad)
+                  }
+                  root.addView(TextView(this).apply {
+                      textSize = 16f
+                      text = "1. Tap the button below, open Accessibility and turn on Auto Fill.\n\n" +
+                          "2. Open the target app. A small floating panel will appear on the right.\n\n" +
+                          "3. Enter Email, OTP and Area code in the panel, then press Start."
+                  })
+                  root.addView(Button(this).apply {
+                      text = "Open Accessibility Settings"
+                      setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  })
+                  setContentView(root)
+              }
+          }
+          EOF
+          cat > app/src/main/java/com/autofill/helper/AutoService.kt <<'EOF'
+          package com.autofill.helper
+
+          import android.accessibilityservice.AccessibilityService
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.PixelFormat
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.text.Editable
+          import android.text.InputFilter
+          import android.text.InputType
+          import android.text.TextWatcher
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.view.accessibility.AccessibilityNodeInfo
+          import android.view.accessibility.AccessibilityWindowInfo
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+
+          class AutoService : AccessibilityService() {
+
+              private val handler = Handler(Looper.getMainLooper())
+              private var running = false
+              private var wm: WindowManager? = null
+              private var panel: LinearLayout? = null
+              private lateinit var lp: WindowManager.LayoutParams
+              private lateinit var body: LinearLayout
+              private lateinit var etEmail: EditText
+              private lateinit var etOtp: EditText
+              private lateinit var etArea: EditText
+              private lateinit var btnToggle: Button
+              private val done = HashSet<String>()
+              private var lastStart = 0L
+              private val prefs by lazy { getSharedPreferences("cfg", Context.MODE_PRIVATE) }
+              private val NOT_FOCUSABLE = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                  buildPanel()
+              }
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+              override fun onInterrupt() {}
+
+              override fun onDestroy() {
+                  running = false
+                  handler.removeCallbacksAndMessages(null)
+                  panel?.let { try { wm?.removeView(it) } catch (_: Exception) {} }
+                  super.onDestroy()
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              private fun field(hintText: String, type: Int, saveKey: String?): EditText = EditText(this).apply {
+                  hint = hintText
+                  setSingleLine()
+                  inputType = type
+                  textSize = 14f
+                  setTextColor(Color.BLACK)
+                  setHintTextColor(Color.GRAY)
+                  setPadding(dp(8), dp(6), dp(8), dp(6))
+                  background = GradientDrawable().apply { setColor(Color.WHITE); cornerRadius = dp(8).toFloat() }
+                  if (saveKey != null) {
+                      setText(prefs.getString(saveKey, ""))
+                      addTextChangedListener(object : TextWatcher {
+                          override fun afterTextChanged(s: Editable?) { prefs.edit().putString(saveKey, s.toString()).apply() }
+                          override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                          override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                      })
+                  }
+                  setOnTouchListener { v, ev ->
+                      if (ev.action == MotionEvent.ACTION_DOWN) { allowFocus(true); v.post { v.requestFocus() } }
+                      false
+                  }
+              }
+
+              private fun buildPanel() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(8), dp(6), dp(8), dp(6))
+                      background = GradientDrawable().apply { setColor(0xEE222222.toInt()); cornerRadius = dp(12).toFloat() }
+                  }
+                  val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+                  btnToggle = Button(this).apply {
+                      text = "▶ Start"; minHeight = 0; minimumHeight = 0
+                      setOnClickListener { onToggle() }
+                  }
+                  val btnMin = Button(this).apply {
+                      text = "–"; minHeight = 0; minimumHeight = 0; minWidth = 0; minimumWidth = 0
+                      setOnClickListener { body.visibility = if (body.visibility == View.VISIBLE) View.GONE else View.VISIBLE }
+                  }
+                  header.addView(btnToggle, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+                  header.addView(btnMin, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  etEmail = field("Email", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_EMAIL_ADDRESS, "email")
+                  etOtp = field("OTP", InputType.TYPE_CLASS_NUMBER, null)
+                  etArea = field("Area code (e.g. 415)", InputType.TYPE_CLASS_NUMBER, "area")
+                  etArea.filters = arrayOf(InputFilter.LengthFilter(3))
+                  for (f in listOf(etEmail, etOtp, etArea)) {
+                      body.addView(f, LinearLayout.LayoutParams(-1, -2).apply { topMargin = dp(6) })
+                  }
+                  root.addView(header)
+                  root.addView(body)
+
+                  lp = WindowManager.LayoutParams(
+                      dp(240), WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      NOT_FOCUSABLE, PixelFormat.TRANSLUCENT
+                  ).apply { gravity = Gravity.TOP or Gravity.END; x = dp(6); y = dp(90) }
+                  panel = root
+                  wm?.addView(root, lp)
+              }
+
+              private fun allowFocus(on: Boolean) {
+                  val p = panel ?: return
+                  val locked = (lp.flags and NOT_FOCUSABLE) != 0
+                  if (on && locked) { lp.flags = lp.flags and NOT_FOCUSABLE.inv(); wm?.updateViewLayout(p, lp) }
+                  else if (!on && !locked) { lp.flags = lp.flags or NOT_FOCUSABLE; wm?.updateViewLayout(p, lp) }
+              }
+
+              private fun onToggle() {
+                  val typing = (lp.flags and NOT_FOCUSABLE) == 0
+                  for (f in listOf(etEmail, etOtp, etArea)) f.clearFocus()
+                  panel?.let { (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(it.windowToken, 0) }
+                  allowFocus(false)
+                  if (typing) { if (!running) start(); return }
+                  if (running) stop() else start()
+              }
+
+              private fun start() { running = true; done.clear(); btnToggle.text = "■ Stop"; handler.post(tick) }
+              private fun stop() { running = false; done.clear(); btnToggle.text = "▶ Start"; handler.removeCallbacks(tick) }
+
+              private val tick = object : Runnable {
+                  override fun run() {
+                      if (!running) return
+                      try { step() } catch (_: Exception) {}
+                      handler.postDelayed(this, Config.TICK_MS)
+                  }
+              }
+
+              private fun targetRoot(): AccessibilityNodeInfo? {
+                  for (w in windows) {
+                      if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION) continue
+                      val r = w.root ?: continue
+                      if (r.packageName?.toString() != packageName) return r
+                  }
+                  val r = rootInActiveWindow
+                  return if (r != null && r.packageName?.toString() != packageName) r else null
+              }
+
+              private fun collect(n: AccessibilityNodeInfo?, out: MutableList<AccessibilityNodeInfo>) {
+                  if (n == null) return
+                  out.add(n)
+                  for (i in 0 until n.childCount) collect(n.getChild(i), out)
+              }
+
+              private fun lbl(n: AccessibilityNodeInfo): String =
+                  (n.text?.toString() ?: n.contentDescription?.toString() ?: "").lowercase().trim()
+
+              private fun labelOf(nodes: List<AccessibilityNodeInfo>, i: Int): String {
+                  val n = nodes[i]
+                  val own = ((n.hintText?.toString() ?: "") + " " + (n.contentDescription?.toString() ?: "")).lowercase().trim()
+                  if (own.isNotEmpty()) return own
+                  var j = i - 1
+                  while (j >= 0) {
+                      if (nodes[j].isEditable) break
+                      val t = lbl(nodes[j])
+                      if (t.isNotEmpty()) return t
+                      j--
+                  }
+                  return ""
+              }
+
+              private fun matches(label: String, keys: List<String>) = keys.any { label.contains(it) }
+
+              private fun isEmptyField(n: AccessibilityNodeInfo): Boolean {
+                  val t = n.text
+                  return t == null || t.isEmpty() || n.isShowingHintText
+              }
+
+              private fun fill(n: AccessibilityNodeInfo, s: String): Boolean {
+                  n.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                  val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, s) }
+                  return n.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+              }
+
+              private fun step() {
+                  if ((lp.flags and NOT_FOCUSABLE) == 0) return
+                  val root = targetRoot() ?: return
+                  val nodes = ArrayList<AccessibilityNodeInfo>()
+                  collect(root, nodes)
+
+                  var did = false
+                  for ((i, n) in nodes.withIndex()) {
+                      if (!n.isEditable || !n.isVisibleToUser || !isEmptyField(n)) continue
+                      val label = labelOf(nodes, i)
+                      when {
+                          matches(label, Config.AREA) -> {
+                              val a = etArea.text.toString().trim()
+                              if (a.isNotEmpty()) did = fill(n, a) || did
+                          }
+                          matches(label, Config.FIRST) -> did = fill(n, Names.first.random()) || did
+                          matches(label, Config.LAST) -> did = fill(n, Names.last.random()) || did
+                          matches(label, Config.EMAIL) -> {
+                              val e = etEmail.text.toString().trim()
+                              if (e.isNotEmpty()) did = fill(n, e) || did
+                          }
+                          matches(label, Config.OTP) -> {
+                              val o = etOtp.text.toString().trim()
+                              if (o.isNotEmpty() && fill(n, o)) { did = true; etOtp.setText("") }
+                          }
+                      }
+                  }
+                  if (did) return
+
+                  val now = System.currentTimeMillis()
+                  // 1) Start building now -> new cycle
+                  val startNode = findButton(nodes, Config.START)
+                  if (startNode != null && now - lastStart > Config.START_RETRY_MS) {
+                      if (click(startNode)) { lastStart = now; done.clear(); return }
+                  }
+              
